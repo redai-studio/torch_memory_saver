@@ -92,6 +92,7 @@ with torch_memory_saver.region(enable_cpu_backup=True, cpu_backup_backend="mmap"
 ROCm stays pinned (`hipHostMalloc`); `cpu_backup_backend="mmap"` is rejected. On the legacy ROCm path, host shadows are retained across resume. XPU host shadows are pageable `malloc`/`free`; `cpu_backup_backend` is not supported there.
 
 `TMS_INIT_CPU_BACKUP_BACKEND=mmap|pinned` sets the process default for preload / env-driven integrations; an explicit `cpu_backup_backend=` argument overrides it.
+On CUDA, a pinned CPU backup falls back to `mmap` if `cudaMallocHost` reports `cudaErrorMemoryAllocation`.
 
 Pinned or mmap CPU backups on CUDA, MUSA and MLU, and pinned backups on ROCm 7+, can be retained
 across resume cycles to avoid reallocating them before every pause:

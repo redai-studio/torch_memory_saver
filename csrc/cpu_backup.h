@@ -20,9 +20,10 @@ enum class CpuBackupKind : uint8_t {
 constexpr CpuBackupKind kDefaultCpuBackupKind = CpuBackupKind::PINNED;
 
 struct CpuBackupSlot {
-    CpuBackupKind kind = kDefaultCpuBackupKind;
+    CpuBackupKind preferred_kind = kDefaultCpuBackupKind;
     void* data = nullptr;
     size_t size = 0;
+    CpuBackupKind kind = preferred_kind;
 };
 
 namespace cpu_backuper {
@@ -49,23 +50,38 @@ inline void onload(void*, size_t, CUdevice, const CpuBackupSlot&) {
 
 #else
 
+inline void* allocate_mmap(size_t size) {
+    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        const int err = errno;
+        SIMPLE_CHECK(false,
+                     "mmap cpu_backup failed errno=" << err << " " << strerror(err));
+    }
+    return ptr;
+}
+
 inline void allocate(size_t size, CpuBackupSlot& slot) {
+    slot.kind = slot.preferred_kind;
     switch (slot.kind) {
-        case CpuBackupKind::MMAP: {
-            void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (p == MAP_FAILED) {
-                const int err = errno;
-                SIMPLE_CHECK(false,
-                             "mmap cpu_backup failed errno=" << err << " " << strerror(err));
-            }
-            slot.data = p;
+        case CpuBackupKind::MMAP:
+            slot.data = allocate_mmap(size);
             break;
-        }
-        case CpuBackupKind::PINNED:
-            CUDA_ERROR_CHECK(cudaMallocHost(&slot.data, size));
+        case CpuBackupKind::PINNED: {
+            const cudaError_t status = cudaMallocHost(&slot.data, size);
+#if defined(USE_CUDA)
+            if (status == cudaErrorMemoryAllocation) {
+                // Clear the recovered runtime error before copying into the mmap buffer.
+                (void)cudaGetLastError();
+                slot.data = allocate_mmap(size);
+                slot.kind = CpuBackupKind::MMAP;
+                break;
+            }
+#endif
+            CUDA_ERROR_CHECK(status);
             SIMPLE_CHECK(slot.data != nullptr, "cudaMallocHost cpu_backup returned nullptr");
             break;
+        }
         default:
             SIMPLE_CHECK(false, "unknown cpu_backup_kind=" << static_cast<int>(slot.kind));
     }
