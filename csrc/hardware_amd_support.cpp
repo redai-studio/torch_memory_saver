@@ -130,9 +130,10 @@ namespace ROCmHIPImplementation {
     cudaError_t rocm_malloc(
         void **ptr, 
         CUdevice device, 
-        size_t size, 
+        size_t raw_size,
         const std::string& tag, 
         bool enable_cpu_backup,
+        CpuBackupKind cpu_backup_kind,
         std::unordered_map<void*, AllocationMetadata>& allocation_metadata,
         std::mutex& allocator_metadata_mutex
     ) {
@@ -146,7 +147,7 @@ namespace ROCmHIPImplementation {
         size_t granularity;
         CURESULT_CHECK(hipMemGetAllocationGranularity(&granularity, &prop,
                                                 hipMemAllocationGranularityMinimum));
-        size_t aligned_size = ((size + granularity - 1) / granularity) * granularity;
+        size_t aligned_size = ((raw_size + granularity - 1) / granularity) * granularity;
         aligned_size = (aligned_size + MEMCREATE_CHUNK_SIZE - 1) / MEMCREATE_CHUNK_SIZE * MEMCREATE_CHUNK_SIZE;
 
         assert(MEMCREATE_CHUNK_SIZE % granularity == 0);
@@ -162,7 +163,7 @@ namespace ROCmHIPImplementation {
 
 #ifdef TMS_DEBUG_LOG
         std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.cuda_malloc "
-                  << " ptr=" << ptr << " size=" << size
+                  << " ptr=" << ptr << " raw_size=" << raw_size
                   << " granularity=" << granularity
                   << " aligned_size=" << aligned_size
                   << " node_id=" << node_id
@@ -187,14 +188,25 @@ namespace ROCmHIPImplementation {
             const std::lock_guard<std::mutex> lock(allocator_metadata_mutex);
             allocation_metadata.emplace(
                 *ptr,
-                AllocationMetadata{size, device, tag, AllocationState::ACTIVE, enable_cpu_backup, nullptr, aligned_size, std::move(allocHandles), std::move(chunk_sizes)}
+                AllocationMetadata{
+                    raw_size,
+                    device,
+                    tag,
+                    AllocationState::ACTIVE,
+                    enable_cpu_backup,
+                    CpuBackupSlot{cpu_backup_kind, nullptr, 0},
+                    false,
+                    DiskBackupSlot{},
+                    aligned_size,
+                    std::move(allocHandles),
+                    std::move(chunk_sizes)}
             );
         }
 
 #ifdef TMS_DEBUG_LOG
         size_t num_chunks = allocation_metadata[*ptr].allocHandles.size();
         std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.cuda_malloc "
-                  << " ptr=" << ptr << " *ptr=" << *ptr << " size=" << size
+                  << " ptr=" << ptr << " *ptr=" << *ptr << " raw_size=" << raw_size
                   << " aligned_size=" << aligned_size
                   << " num_chunks=" << num_chunks
                   << std::endl;
@@ -216,20 +228,18 @@ namespace ROCmHIPImplementation {
             allocation_metadata.erase(ptr);
         }
 
-        // Unmap and release chunks
-        cu_mem_unmap_and_release(metadata.device, metadata.size, (hipDeviceptr_t)ptr, metadata.allocHandles, metadata.chunk_sizes);
+        if (AllocationState::ACTIVE == metadata.state) {
+            cu_mem_unmap_and_release(metadata.device, metadata.aligned_size, (hipDeviceptr_t)ptr, metadata.allocHandles, metadata.chunk_sizes);
+        }
 
         // Free the reserved address using stored aligned_size
         CURESULT_CHECK(hipMemAddressFree((hipDeviceptr_t)ptr, metadata.aligned_size));
 
-        if (nullptr != metadata.cpu_backup) {
-            CUDA_ERROR_CHECK(hipFreeHost(metadata.cpu_backup));
-            metadata.cpu_backup = nullptr;
-        }
+        cpu_backuper::release(metadata.cpu_backup);
 
 #ifdef TMS_DEBUG_LOG
         std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.cuda_free "
-                  << " ptr=" << ptr << " size=" << metadata.size
+                  << " ptr=" << ptr << " raw_size=" << metadata.raw_size
                   << " aligned_size=" << metadata.aligned_size
                   << " num_chunks=" << metadata.allocHandles.size()
                   << std::endl;
@@ -263,11 +273,7 @@ namespace ROCmHIPImplementation {
 
             // Copy data to CPU backup if enabled
             if (metadata.enable_cpu_backup) {
-                if (nullptr == metadata.cpu_backup) {
-                    CUDA_ERROR_CHECK(hipMallocHost(&metadata.cpu_backup, metadata.aligned_size));
-                }
-                SIMPLE_CHECK(metadata.cpu_backup != nullptr, "cpu_backup should not be nullptr");
-                CUDA_ERROR_CHECK(cudaMemcpy(metadata.cpu_backup, ptr, metadata.aligned_size, hipMemcpyDeviceToHost));
+                cpu_backuper::offload(ptr, metadata.aligned_size, metadata.cpu_backup);
             }
 
             // Unmap and release chunks (but keep metadata for resume)
@@ -277,7 +283,7 @@ namespace ROCmHIPImplementation {
 
 #ifdef TMS_DEBUG_LOG
             std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.pause"
-                    << " ptr=" << ptr << " size=" << metadata.size 
+                    << " ptr=" << ptr << " raw_size=" << metadata.raw_size
                     << " aligned_size=" << metadata.aligned_size
                     << " num_chunks=" << metadata.allocHandles.size()
                     << " tag=" << metadata.tag << " filter_tag=" << tag
@@ -315,15 +321,15 @@ namespace ROCmHIPImplementation {
 
             // Restore from CPU backup if enabled
             if (metadata.enable_cpu_backup) {
-                SIMPLE_CHECK(metadata.cpu_backup != nullptr, "cpu_backup should not be nullptr");
-                CUDA_ERROR_CHECK(cudaMemcpy(ptr, metadata.cpu_backup, metadata.aligned_size, hipMemcpyHostToDevice));
+                cpu_backuper::onload(
+                    ptr, metadata.aligned_size, metadata.device, metadata.cpu_backup);
             }
 
             metadata.state = AllocationState::ACTIVE;
 
 #ifdef TMS_DEBUG_LOG
             std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.resume"
-                    << " ptr=" << ptr << " size=" << metadata.size
+                    << " ptr=" << ptr << " raw_size=" << metadata.raw_size
                     << " aligned_size=" << metadata.aligned_size
                     << " num_chunks=" << metadata.allocHandles.size()
                     << " tag=" << metadata.tag << " filter_tag=" << tag

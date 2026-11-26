@@ -3,6 +3,10 @@
 #include "api_forwarder.h"
 #include <optional>
 #include "macro.h"
+#include "cpu_backup.h"
+#if defined(USE_MUSA)
+#include "hardware_musa_support.h"
+#endif
 
 // ----------------------------------------------- threadlocal configs --------------------------------------------------
 
@@ -32,9 +36,31 @@ public:
         enable_cpu_backup_ = value;
     }
 
+    CpuBackupKind cpu_backup_kind() const {
+        return cpu_backup_kind_;
+    }
+
+    void set_cpu_backup_kind(CpuBackupKind value) {
+        cpu_backup_kind_ = value;
+    }
+
+    bool enable_disk_backup() {
+        if (!enable_disk_backup_.has_value()) {
+            enable_disk_backup_ = get_bool_env_var("TMS_INIT_ENABLE_DISK_BACKUP");
+        }
+        return enable_disk_backup_.value();
+    }
+
+    void set_enable_disk_backup(bool value) {
+        enable_disk_backup_ = value;
+    }
+
 private:
     std::optional<bool> is_interesting_region_;
     std::optional<bool> enable_cpu_backup_;
+    CpuBackupKind cpu_backup_kind_ = cpu_backup_kind_from_str(
+        std::getenv("TMS_INIT_CPU_BACKUP_BACKEND"));
+    std::optional<bool> enable_disk_backup_;
 };
 static thread_local ThreadLocalConfig thread_local_config;
 
@@ -43,8 +69,15 @@ static thread_local ThreadLocalConfig thread_local_config;
 #ifdef TMS_HOOK_MODE_PRELOAD
 cudaError_t cudaMalloc(void **ptr, size_t size) {
     if (thread_local_config.is_interesting_region()) {
+#if defined(USE_MUSA)
+        if (MUSAImplementation::caller_requires_plain_malloc(__builtin_return_address(0))) {
+            return APIForwarder::call_real_cuda_malloc(ptr, size);
+        }
+#endif
         return TorchMemorySaver::instance().malloc(
-            ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_, thread_local_config.enable_cpu_backup());
+            ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_,
+            thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
+            thread_local_config.enable_disk_backup());
     } else {
         return APIForwarder::call_real_cuda_malloc(ptr, size);
     }
@@ -66,7 +99,9 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
     SIMPLE_CHECK(thread_local_config.is_interesting_region(), "only support interesting region");
     void *ptr;
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().malloc(
-        &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_, thread_local_config.enable_cpu_backup()));
+        &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
+        thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
+        thread_local_config.enable_disk_backup()));
     return ptr;
 }
 
@@ -76,7 +111,9 @@ void tms_torch_free(void *ptr, ssize_t ssize, int device, cudaStream_t stream) {
               << " ptr=" << ptr << " ssize=" << ssize << " device=" << device << " stream=" << stream
               << std::endl;
 #endif
+#if !defined(USE_XPU) && !defined(USE_MLU)
     SIMPLE_CHECK(thread_local_config.is_interesting_region(), "only support interesting region");
+#endif
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().free(ptr));
 }
 }
@@ -110,26 +147,89 @@ void tms_set_enable_cpu_backup(bool enable_cpu_backup) {
     thread_local_config.set_enable_cpu_backup(enable_cpu_backup);
 }
 
+const char* tms_get_cpu_backup_backend() {
+    return cpu_backup_kind_to_str(thread_local_config.cpu_backup_kind());
+}
+
+void tms_set_cpu_backup_backend(const char* backend) {
+    thread_local_config.set_cpu_backup_kind(cpu_backup_kind_from_str(backend));
+}
+
+bool tms_get_enable_disk_backup() {
+    return thread_local_config.enable_disk_backup();
+}
+
+void tms_set_enable_disk_backup(bool enable_disk_backup) {
+    thread_local_config.set_enable_disk_backup(enable_disk_backup);
+}
+
+void tms_set_disk_backup_dir(const char* dir) {
+    SIMPLE_CHECK(dir != nullptr, "disk backup dir should not be null");
+    TorchMemorySaver::instance().set_disk_backup_dir(std::string(dir));
+}
+
 void set_memory_margin_bytes(uint64_t value) {
     TorchMemorySaver::instance().set_memory_margin_bytes(value);
 }
 
-void tms_pause(const char* tag) {
-    std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
-    TorchMemorySaver::instance().pause(tag_str);
+void tms_set_retain_cpu_backup(bool retain_cpu_backup) {
+#if !TMS_SUPPORTS_RETAIN_CPU_BACKUP
+    SIMPLE_CHECK(!retain_cpu_backup, "retained CPU backup policy needs CUDA, MUSA, MLU or ROCm 7+");
+#else
+    TorchMemorySaver::instance().set_retain_cpu_backup(retain_cpu_backup);
+#endif
 }
 
-void tms_resume(const char* tag) {
-    std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
-    TorchMemorySaver::instance().resume(tag_str);
+bool tms_get_retain_cpu_backup() {
+#if !TMS_SUPPORTS_RETAIN_CPU_BACKUP
+    return false;
+#else
+    return TorchMemorySaver::instance().get_retain_cpu_backup();
+#endif
 }
 
-void tms_pre_allocate_cpu_backup(const char* tag) {
+int tms_pause(const char* tag) {
     std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
-    TorchMemorySaver::instance().pre_allocate_cpu_backup(tag_str);
+    return static_cast<int>(TorchMemorySaver::instance().pause(tag_str));
+}
+
+int tms_resume(const char* tag) {
+    std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
+    return static_cast<int>(TorchMemorySaver::instance().resume(tag_str));
+}
+
+uint32_t tms_affected_devices(const char* tag, int* out_device_ids, uint32_t capacity) {
+    return TorchMemorySaver::instance().affected_devices(tag, out_device_ids, capacity);
 }
 
 uint8_t* tms_get_cpu_backup_pointer(const uint8_t* gpu_ptr, uint64_t size) {
     return TorchMemorySaver::instance().get_cpu_backup_pointer(gpu_ptr, size);
 }
+
+#if defined(USE_XPU)
+void tms_xpu_prewarm_devices(int n_devices) {
+    XPUImplementation::xpu_prewarm_devices(n_devices);
+}
+
+uint64_t tms_xpu_device_free_bytes(int device_id) {
+    return XPUImplementation::xpu_device_free_bytes(device_id);
+}
+
+uint64_t tms_xpu_committed_bytes(int device_id) {
+    return TorchMemorySaver::instance().xpu_committed_bytes(device_id);
+}
+
+uint64_t tms_xpu_leaked_bytes(int device_id) {
+    return TorchMemorySaver::instance().xpu_leaked_bytes(device_id);
+}
+
+uint64_t tms_xpu_tracked_bytes(int device_id) {
+    return TorchMemorySaver::instance().xpu_tracked_bytes(device_id);
+}
+
+// Test-only: returns the error instead of aborting, so fault injection can observe it.
+int tms_xpu_free(const void* ptr) {
+    return static_cast<int>(TorchMemorySaver::instance().free(const_cast<void*>(ptr)));
+}
+#endif
 }

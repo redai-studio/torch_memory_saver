@@ -6,15 +6,17 @@ import logging
 import os
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Optional
+from typing import Literal, Optional
 import torch
 
 from .binary_wrapper import BinaryWrapper
 from .hooks.base import HookUtilBase, HookMode
+from .utils import is_mlu, is_musa, is_xpu
 
 logger = logging.getLogger(__name__)
 
 _TAG_DEFAULT = "default"
+CpuBackupBackend = Literal["mmap", "pinned"]
 
 
 class TorchMemorySaver:
@@ -23,31 +25,52 @@ class TorchMemorySaver:
         self._impl: Optional[_TorchMemorySaverImpl] = None
 
     @contextmanager
-    def region(self, tag: str = _TAG_DEFAULT, enable_cpu_backup: bool = False):
-        """Context manager for memory saving with optional tag"""
+    def region(
+        self,
+        tag: str = _TAG_DEFAULT,
+        enable_cpu_backup: bool = False,
+        enable_disk_backup: bool = False,
+        cpu_backup_backend: Optional[CpuBackupBackend] = None,
+    ):
+        """Context manager for memory saving with optional tag.
+
+        enable_disk_backup spills paused memory to files instead of a CPU
+        buffer; mutually exclusive with enable_cpu_backup. The target directory is
+        process-global (TMS_DISK_BACKUP_DIR or set_disk_backup_dir()), not
+        region-scoped, and must be a real disk mount (not tmpfs).
+
+        cpu_backup_backend selects the host shadow when enable_cpu_backup is True:
+        "pinned" (default; cudaMallocHost/hipHostMalloc/musaMallocHost) or "mmap"
+        (reclaimable RSS on CUDA/MUSA/MLU). ROCm is pinned-only. XPU uses pageable
+        malloc and does not take cpu_backup_backend.
+        """
+        self._validate_cpu_backup_backend(enable_cpu_backup, cpu_backup_backend)
         self._ensure_initialized()
-        with self._impl.region(tag=tag, enable_cpu_backup=enable_cpu_backup):
+        assert not (enable_cpu_backup and enable_disk_backup), \
+            "enable_cpu_backup and enable_disk_backup are mutually exclusive"
+        with self._impl.region(
+            tag=tag,
+            enable_cpu_backup=enable_cpu_backup,
+            enable_disk_backup=enable_disk_backup,
+            cpu_backup_backend=cpu_backup_backend,
+        ):
             yield
 
     @contextmanager
     def cuda_graph(
-        self,
-        cuda_graph,
-        pool=None,
-        stream=None,
-        capture_error_mode="global",
-        tag: str = _TAG_DEFAULT,
-        enable_cpu_backup: bool = False,
+            self,
+            cuda_graph, pool=None, stream=None, capture_error_mode='global',
+            tag: str = _TAG_DEFAULT, enable_cpu_backup: bool = False,
+            cpu_backup_backend: Optional[CpuBackupBackend] = None,
     ):
         """Similar to `torch.cuda.graph`, but ensures memory in it to be pauseable."""
+        self._validate_cpu_backup_backend(enable_cpu_backup, cpu_backup_backend)
         self._ensure_initialized()
         with self._impl.cuda_graph(
-            cuda_graph=cuda_graph,
-            pool=pool,
-            stream=stream,
-            capture_error_mode=capture_error_mode,
-            tag=tag,
-            enable_cpu_backup=enable_cpu_backup,
+                cuda_graph=cuda_graph,
+                pool=pool, stream=stream, capture_error_mode=capture_error_mode,
+                tag=tag, enable_cpu_backup=enable_cpu_backup,
+                cpu_backup_backend=cpu_backup_backend,
         ):
             yield
 
@@ -66,16 +89,6 @@ class TorchMemorySaver:
         """Resume memory for specific tag or all memory if tag is None"""
         self._ensure_initialized()
         self._impl.resume(tag=tag)
-
-    def pre_allocate_cpu_backup(self, tag: Optional[str] = None):
-        """Pre-allocate CPU backup buffers for all managed allocations.
-
-        Call this after model loading to lock pinned host memory while
-        physical memory is still unfragmented.  Subsequent pause() calls
-        will reuse these buffers instead of allocating new ones.
-        """
-        self._ensure_initialized()
-        self._impl.pre_allocate_cpu_backup(tag=tag)
 
     # for compatibility
     @property
@@ -98,11 +111,51 @@ class TorchMemorySaver:
     @memory_margin_bytes.setter
     def memory_margin_bytes(self, value: int):
         self._ensure_initialized()
+        if self._impl._is_xpu:
+            raise NotImplementedError(
+                "TorchMemorySaver.memory_margin_bytes is not supported on Intel "
+                "XPU: the OOM-margin guard needs a device-wide free-bytes "
+                "reading, which the Intel GPU driver does not provide reliably "
+                "(free-bytes telemetry is frozen). Manage device memory headroom "
+                "outside torch_memory_saver instead."
+            )
         self._impl._binary_wrapper.cdll.set_memory_margin_bytes(value)
+
+    @property
+    def retain_cpu_backup(self) -> bool:
+        self._ensure_initialized()
+        return self._impl._binary_wrapper.cdll.tms_get_retain_cpu_backup()
+
+    @retain_cpu_backup.setter
+    def retain_cpu_backup(self, value: bool):
+        self._ensure_initialized()
+        self._impl._binary_wrapper.cdll.tms_set_retain_cpu_backup(value)
 
     def get_cpu_backup(self, x: torch.Tensor, zero_copy: bool = False):
         self._ensure_initialized()
         return self._impl.get_cpu_backup(x, zero_copy=zero_copy)
+
+    def set_disk_backup_dir(self, path: str):
+        """Set the directory for disk backup files (created if needed)."""
+        self._ensure_initialized()
+        os.makedirs(path, exist_ok=True)
+        self._impl._binary_wrapper.cdll.tms_set_disk_backup_dir(path.encode("utf-8"))
+
+    def _validate_cpu_backup_backend(
+        self,
+        enable_cpu_backup: bool,
+        cpu_backup_backend: Optional[CpuBackupBackend],
+    ) -> None:
+        if cpu_backup_backend is None:
+            return
+        if not enable_cpu_backup:
+            raise ValueError("cpu_backup_backend requires enable_cpu_backup=True")
+        if is_xpu():
+            raise ValueError(
+                "cpu_backup_backend is not supported on XPU; host shadows use malloc"
+            )
+        if cpu_backup_backend == "mmap" and torch.version.hip:
+            raise ValueError("cpu_backup_backend='mmap' is not supported on ROCm")
 
     def _ensure_initialized(self):
         if self._impl is not None:
@@ -113,56 +166,182 @@ class TorchMemorySaver:
 
 class _TorchMemorySaverImpl:
     def __init__(self, hook_mode: HookMode = "preload"):
+        self._is_xpu = is_xpu()
+        self._is_musa = is_musa()
+        if self._is_xpu:
+            assert hook_mode == "torch", (
+                "XPU only supports hook_mode='torch' (in-process pluggable "
+                "allocator); preload/LD_PRELOAD is CUDA-only."
+            )
         self._hook_mode = hook_mode
         self._hook_util = HookUtilBase.create(hook_mode=hook_mode)
         self._binary_wrapper = BinaryWrapper(path_binary=self._hook_util.get_path_binary())
-        self._mem_pools = defaultdict(lambda: torch.cuda.MemPool(allocator=self._hook_util.get_allocator()))
+
+        self._device_module = torch.get_device_module()
+
+        if self._is_xpu:
+            # Prewarm per-device SYCL contexts before registering the allocator.
+            if hasattr(self._binary_wrapper.cdll, "tms_xpu_prewarm_devices"):
+                self._binary_wrapper.cdll.tms_xpu_prewarm_devices(
+                    self._device_module.device_count()
+                )
+
+        self._mem_pools = defaultdict(
+            lambda: self._device_module.MemPool(allocator=self._hook_util.get_allocator())
+        )
+        if self._is_musa:
+            import threading
+
+            # MusaMemPool.use() temporarily replaces the process-global
+            # empty_cache, so overlapping disable() scopes are unsupported.
+            self._musa_disable_lock = threading.Lock()
+            self._musa_region_depth_local = threading.local()
+
         _sanity_checks()
-        if torch.version.hip:
-            # Unlike CUDA where cuMem* are Driver API calls, HIP puts everything in user-space libraries
-            # whose C++ static destructors may run before MemPool's destructor during process exit ("static
-            # destruction order fiasco"). By clearing _mem_pools in an atexit handler, we ensure MemPool
-            # destruction (and thus HIP API calls) happens while the HIP/HSA runtime is still fully alive.
+        if torch.version.hip or self._is_xpu:
+            # HIP/SYCL runtime static dtors may run before MemPool's at exit
+            # (destruction-order fiasco); free pools via atexit while runtime alive.
             atexit.register(self._mem_pools.clear)
 
-    @contextmanager
-    def region(self, tag: str, enable_cpu_backup: bool):
-        # For hook_mode=preload, we need this b/c https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
-        # (For hook_mode=torch we may not need it, but currently our primary usage is hook_mode=preload, thus we do this for simplicity)
-        mem_pool = self._mem_pools[(tag, enable_cpu_backup)]
-        with torch.cuda.use_mem_pool(mem_pool):
-            with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
-                yield
+    @property
+    def _musa_region_depth(self) -> int:
+        """region() nesting depth on the calling thread (MUSA only)."""
+        return getattr(self._musa_region_depth_local, "value", 0)
+
+    @_musa_region_depth.setter
+    def _musa_region_depth(self, depth: int) -> None:
+        self._musa_region_depth_local.value = depth
 
     @contextmanager
-    def cuda_graph(self, cuda_graph, pool, stream, capture_error_mode, tag: str, enable_cpu_backup: bool):
+    def region(
+        self,
+        tag: str,
+        enable_cpu_backup: bool,
+        enable_disk_backup: bool,
+        cpu_backup_backend: Optional[CpuBackupBackend],
+    ):
+        if is_mlu():
+            _sanity_checks()
+        if self._is_xpu and enable_disk_backup:
+            raise NotImplementedError(
+                "TorchMemorySaver disk backup (enable_disk_backup=True) is not "
+                "supported on Intel XPU; use enable_cpu_backup=True instead."
+            )
+        # See https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
+        # Key by device too: a MemPool is bound to its creation device, so a
+        # multi-device process must not reuse one device's pool on another.
+        # Include backend so torch-mode pool reuse cannot stick the first kind.
+        device = self._current_device()
+        resolved_cpu_backup_backend = ""
+        if enable_cpu_backup:
+            resolved_cpu_backup_backend = (
+                cpu_backup_backend
+                or self._binary_wrapper.cdll.tms_get_cpu_backup_backend().decode("utf-8")
+            )
+        key = (
+            tag,
+            enable_cpu_backup,
+            enable_disk_backup,
+            resolved_cpu_backup_backend,
+            device,
+        )
+        mem_pool = self._mem_pools[key]
+        with self._device_module.use_mem_pool(mem_pool):
+            with self._with_region_config(
+                tag=tag,
+                enable_cpu_backup=enable_cpu_backup,
+                enable_disk_backup=enable_disk_backup,
+                cpu_backup_backend=cpu_backup_backend,
+            ):
+                yield
+
+    def _current_device(self) -> int:
+        return self._device_module.current_device()
+
+    @contextmanager
+    def cuda_graph(
+        self,
+        cuda_graph,
+        pool,
+        stream,
+        capture_error_mode,
+        tag: str,
+        enable_cpu_backup: bool,
+        cpu_backup_backend: Optional[CpuBackupBackend],
+    ):
         assert self._hook_mode == "preload", "Only hook_mode=preload supports pauseable CUDA Graph currently"
-        with torch.cuda.graph(cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode):
-            with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+        if is_mlu():
+            _sanity_checks()
+        with self._device_module.graph(cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode):
+            with self._with_region_config(
+                tag=tag,
+                enable_cpu_backup=enable_cpu_backup,
+                cpu_backup_backend=cpu_backup_backend,
+            ):
                 yield
 
     @contextmanager
-    def _with_region_config(self, tag: str, enable_cpu_backup: bool):
+    def _with_region_config(
+        self,
+        tag: str,
+        enable_cpu_backup: bool,
+        cpu_backup_backend: Optional[CpuBackupBackend],
+        enable_disk_backup: bool = False,
+    ):
         cdll = self._binary_wrapper.cdll
         orig_tag = cdll.tms_get_current_tag().decode("utf-8")
         orig_interesting_region = cdll.tms_get_interesting_region()
         orig_enable_cpu_backup = cdll.tms_get_enable_cpu_backup()
+        orig_cpu_backup_backend = cdll.tms_get_cpu_backup_backend().decode("utf-8")
+        orig_enable_disk_backup = cdll.tms_get_enable_disk_backup()
+        expected_cpu_backup_backend = cpu_backup_backend or orig_cpu_backup_backend
 
-        self._binary_wrapper.set_config(tag=tag, interesting_region=True, enable_cpu_backup=enable_cpu_backup)
+        self._binary_wrapper.set_config(
+            tag=tag,
+            interesting_region=True,
+            enable_cpu_backup=enable_cpu_backup,
+            cpu_backup_backend=cpu_backup_backend,
+            enable_disk_backup=enable_disk_backup,
+        )
+
+        if self._is_musa:
+            # Track nesting on MUSA so disable() rejects a region-enclosed scope instead of nesting two MemPool scopes.
+            musa_region_depth = self._musa_region_depth
         try:
+            if self._is_musa:
+                self._musa_region_depth = musa_region_depth + 1
             yield
         finally:
+            if self._is_musa:
+                self._musa_region_depth = musa_region_depth
             assert cdll.tms_get_interesting_region()
             assert cdll.tms_get_enable_cpu_backup() == enable_cpu_backup
+            assert (
+                cdll.tms_get_cpu_backup_backend().decode("utf-8")
+                == expected_cpu_backup_backend
+            )
+            assert cdll.tms_get_enable_disk_backup() == enable_disk_backup
             assert cdll.tms_get_current_tag().decode("utf-8") == tag
             self._binary_wrapper.set_config(
                 tag=orig_tag,
                 interesting_region=orig_interesting_region,
                 enable_cpu_backup=orig_enable_cpu_backup,
+                cpu_backup_backend=orig_cpu_backup_backend,
+                enable_disk_backup=orig_enable_disk_backup,
             )
 
     @contextmanager
     def disable(self, dispose_mem_pool_after_use: bool = True):
+        if self._is_xpu:
+            raise NotImplementedError(
+                "TorchMemorySaver.disable() is not supported on Intel XPU. "
+                "Allocate outside a region() instead of using disable()."
+            )
+        if self._is_musa:
+            with self._musa_disable(dispose_mem_pool_after_use):
+                yield
+            return
+
         assert dispose_mem_pool_after_use, "Only dispose_mem_pool_after_use=true is supported now"
         assert self._binary_wrapper.cdll.tms_get_interesting_region(), "disable() should be called only when tms is active"
 
@@ -170,27 +349,87 @@ class _TorchMemorySaverImpl:
         try:
             # We can either reuse the pool or delete it immediately, and we implement the latter currently since Slime uses it.
             # About why we need a pool: https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
-            pool = torch.cuda.MemPool()
-            with torch.cuda.use_mem_pool(pool):
+            pool = self._device_module.MemPool()
+            with self._device_module.use_mem_pool(pool):
                 yield
             del pool
         finally:
             self._binary_wrapper.cdll.tms_set_interesting_region(True)
 
+    @contextmanager
+    def _musa_disable(self, dispose_mem_pool_after_use: bool = True):
+        """disable() on MUSA, where the pool needs an explicit release and
+        MusaMemPool.use() temporarily replaces the process-global empty_cache."""
+        from .musa_pool import MusaMemPool
+
+        if self._musa_region_depth > 0:
+            raise RuntimeError(
+                "TorchMemorySaver.disable() cannot be used inside a region() on MUSA: "
+                "the two MemPool scopes cannot be nested"
+            )
+        # The empty_cache shim is process-global, so overlapping scopes would
+        # restore it in the wrong order.
+        if not self._musa_disable_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "TorchMemorySaver.disable() cannot be nested or called concurrently on MUSA"
+            )
+        try:
+            assert dispose_mem_pool_after_use, "Only dispose_mem_pool_after_use=true is supported now"
+            assert self._binary_wrapper.cdll.tms_get_interesting_region(), "disable() should be called only when tms is active"
+
+            self._binary_wrapper.cdll.tms_set_interesting_region(False)
+            try:
+                musa_pool = MusaMemPool()
+                try:
+                    with musa_pool.use():
+                        yield
+                finally:
+                    musa_pool.release()
+            finally:
+                self._binary_wrapper.cdll.tms_set_interesting_region(True)
+        finally:
+            self._musa_disable_lock.release()
+
     def pause(self, tag: Optional[str]):
+        self._sync_affected_devices(tag)
         tag_bytes = tag.encode("utf-8") if tag else None
-        self._binary_wrapper.cdll.tms_pause(tag_bytes)
+        ret = self._binary_wrapper.cdll.tms_pause(tag_bytes)
+        if self._is_xpu and ret != 0:
+            raise RuntimeError(
+                f"torch_memory_saver.pause(tag={tag!r}) partially failed "
+                f"(code {ret}); some allocations could not be released and are "
+                "retained. Retry after resolving the failure."
+            )
 
     def resume(self, tag: Optional[str]):
         tag_bytes = tag.encode("utf-8") if tag else None
-        self._binary_wrapper.cdll.tms_resume(tag_bytes)
+        ret = self._binary_wrapper.cdll.tms_resume(tag_bytes)
+        if self._is_xpu:
+            if ret != 0:
+                raise RuntimeError(
+                    f"torch_memory_saver.resume(tag={tag!r}) partially failed "
+                    f"(code {ret}); some allocations remain paused. Retry after "
+                    "resolving the failure (e.g. free device memory)."
+                )
+            self._sync_affected_devices(tag)
 
-    def pre_allocate_cpu_backup(self, tag: Optional[str]):
-        tag_bytes = tag.encode("utf-8") if tag else None
-        self._binary_wrapper.cdll.tms_pre_allocate_cpu_backup(tag_bytes)
+    def _sync_affected_devices(self, tag: Optional[str]):
+        for device in self._affected_devices(tag):
+            self._device_module.synchronize(device)
+
+    def _affected_devices(self, tag: Optional[str]) -> list[int]:
+        """Read tag-filtered device ids from the backend's locked allocation map."""
+        device_ids = (ctypes.c_int * 64)()
+        count = self._binary_wrapper.cdll.tms_affected_devices(
+            tag.encode("utf-8") if tag else None,
+            device_ids,
+            len(device_ids),
+        )
+        assert count <= len(device_ids), "Too many affected devices"
+        return device_ids[:count]
 
     def get_cpu_backup(self, x: torch.Tensor, zero_copy: bool = False):
-        assert x.is_cuda, f"{x.device=}"
+        assert x.is_cuda or x.is_xpu or (self._is_musa and x.device.type == "musa") or (is_mlu() and x.device.type == "mlu"), f"{x.device=}"
         assert x.is_contiguous(), f"{x.shape=} {x.stride()=} {x.dtype=}"
 
         nbytes = x.nbytes
@@ -215,7 +454,15 @@ class _TorchMemorySaverImpl:
         assert ans.stride() == x.stride(), f"{ans.stride()=} {x.stride()=}"
         return ans
 
-
 def _sanity_checks():
-    if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
-        raise RuntimeError("TorchMemorySaver is disabled for the current process because expandable_segments is not supported yet.")
+    if is_mlu():
+        expandable_segments = torch.mlu.memory._snapshot()["allocator_settings"]["expandable_segments"]
+    else:
+        alloc_confs = ["PYTORCH_CUDA_ALLOC_CONF"]
+        if is_musa():
+            alloc_confs.append("PYTORCH_MUSA_ALLOC_CONF")
+        expandable_segments = any("expandable_segments:True" in os.environ.get(name, "") for name in alloc_confs)
+    if expandable_segments:
+        raise RuntimeError(
+            "TorchMemorySaver is disabled for the current process because expandable_segments is not supported yet."
+        )

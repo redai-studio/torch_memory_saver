@@ -1,54 +1,10 @@
 #pragma once
 #include <iostream>
+#include <limits>
 #include <vector>
-#include <cstdlib>
 #include "macro.h"
 
 // #define TMS_DEBUG_LOG
-
-// ---------------------------------------------------------------------------
-// Runtime log level controlled by TMS_LOG_LEVEL env var:
-//   0 = ERROR only (default)
-//   1 = WARN  (non-fatal issues like fallback to unpinned memory)
-//   2 = INFO  (summary per pause/resume/pre_allocate call)
-//   3 = DEBUG (per-allocation details)
-// ---------------------------------------------------------------------------
-inline int tms_log_level() {
-    static int level = -1;
-    if (level < 0) {
-        const char* env = std::getenv("TMS_LOG_LEVEL");
-        level = env ? std::atoi(env) : 0;
-    }
-    return level;
-}
-
-#define TMS_LOG_ERROR(msg) \
-    std::cerr << "[TMS ERROR] " << msg << std::endl
-
-#define TMS_LOG_WARN(msg) \
-    do { if (tms_log_level() >= 1) std::cerr << "[TMS WARN] " << msg << std::endl; } while(false)
-
-#define TMS_LOG_INFO(msg) \
-    do { if (tms_log_level() >= 2) std::cout << "[TMS INFO] " << msg << std::endl; } while(false)
-
-#define TMS_LOG_DEBUG(msg) \
-    do { if (tms_log_level() >= 3) std::cout << "[TMS DEBUG] " << msg << std::endl; } while(false)
-
-// Non-fatal version of CURESULT_CHECK: logs warning but does NOT exit.
-// CONTEXT should be a stream expression providing extra info, e.g.
-//   CURESULT_WARN(cuMemUnmap(...), "tag=" << tag << " size=" << sz);
-#define CURESULT_WARN(EXPR, CONTEXT) \
-  do { \
-    CUresult __result = (EXPR); \
-    if (__result != CUDA_SUCCESS) { \
-        const char* err_str = nullptr; \
-        cuGetErrorString(__result, &err_str); \
-        TMS_LOG_WARN(#EXPR << " failed: CUresult=" \
-                  << __result << " (" << (err_str ? err_str : "Unknown") << ") " \
-                  << CONTEXT \
-                  << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__); \
-    } \
-  } while (false)
 
 // Cannot use pytorch (libc10.so) since LD_PRELOAD happens earlier than `import torch`
 // Thus copy from torch Macros.h
@@ -122,14 +78,20 @@ namespace CUDAUtils {
             return ans;
         }
 
-        static cudaError_t cu_mem_create(CUmemGenericAllocationHandle *alloc_handle, size_t size, CUdevice device) {
+        static hipMemAllocationProp cu_mem_get_allocation_prop(CUdevice device) {
             hipMemAllocationProp prop = {};
             prop.type = hipMemAllocationTypePinned;
             prop.location.type = hipMemLocationTypeDevice;
             prop.location.id = device;
             prop.allocFlags.compressionType = 0x0;
 
-            hipError_t ret = hipMemCreate(alloc_handle, size, &prop, 0);
+            return prop;
+        }
+
+        static cudaError_t cu_mem_create(CUmemGenericAllocationHandle *alloc_handle, size_t allocation_size, CUdevice device) {
+            const hipMemAllocationProp prop = cu_mem_get_allocation_prop(device);
+
+            hipError_t ret = hipMemCreate(alloc_handle, allocation_size, &prop, 0);
             if (ret == hipErrorOutOfMemory) {
                 std::cerr << "[torch_memory_saver.cpp] hipMemCreate hipErrorOutOfMemory (may not be an issue e.g. torch allocator will free cache and retry)" << std::endl;
                 return hipErrorOutOfMemory;
@@ -139,17 +101,93 @@ namespace CUDAUtils {
             return hipSuccess;
         }
 
-        static void cu_mem_set_access(void *ptr, size_t size, CUdevice device) {
+        static size_t cu_mem_get_allocation_size(size_t raw_size, CUdevice device) {
+            const hipMemAllocationProp prop = cu_mem_get_allocation_prop(device);
+            size_t granularity = 0;
+            CURESULT_CHECK(hipMemGetAllocationGranularity(
+                &granularity, &prop, hipMemAllocationGranularityMinimum));
+            SIMPLE_CHECK(granularity > 0, "hipMemGetAllocationGranularity returned zero");
+            SIMPLE_CHECK(
+                raw_size <= std::numeric_limits<size_t>::max() - (granularity - 1),
+                "allocation size overflow while applying HIP VMM granularity");
+            return ((raw_size + granularity - 1) / granularity) * granularity;
+        }
+
+        // HIP's range check in hipMemUnmap/hipMemSetAccess also counts a hipHostRegister'ed buffer that starts
+        // exactly at the range end and then fails; an unmapped trailing granule keeps that address reserved.
+        static size_t cu_mem_get_reserve_size(size_t allocation_size, CUdevice device) {
+            return allocation_size + cu_mem_get_allocation_size(1, device);
+        }
+
+        static void cu_mem_set_access(void *ptr, size_t allocation_size, CUdevice device) {
             hipMemAccessDesc accessDesc = {};
             accessDesc.location.type = hipMemLocationTypeDevice;
             accessDesc.location.id = device;
             accessDesc.flags = hipMemAccessFlagsProtReadWrite;
-            CURESULT_CHECK(hipMemSetAccess(ptr, size, &accessDesc, 1));
+            CURESULT_CHECK(hipMemSetAccess(ptr, allocation_size, &accessDesc, 1));
+
+            // hipMalloc'd memory is host-visible through the BAR aperture, and PyTorch 2.12+
+            // relies on that: _local_scalar_dense_cuda reads a scalar off a caching-allocator
+            // tensor by dereferencing its device pointer from the host whenever
+            // hipDeviceProp_t::isLargeBar is set. A VMM range carries no host mapping unless
+            // one is requested, so without this grant every .item() on hooked memory faults
+            // inside that read. Accesses are additive, so this leaves the device grant above
+            // in force.
+            hipMemAccessDesc hostAccessDesc = {};
+            hostAccessDesc.location.type = hipMemLocationTypeHost;
+            hostAccessDesc.location.id = 0;
+            hostAccessDesc.flags = hipMemAccessFlagsProtReadWrite;
+            CURESULT_CHECK(hipMemSetAccess(ptr, allocation_size, &hostAccessDesc, 1));
         }
     #endif
 
+#elif defined(USE_MLU)
+    [[maybe_unused]] static CNmemAllocationProp cu_mem_get_allocation_prop(CUdevice device) {
+        CNmemAllocationProp prop = {};
+        prop.type = CN_MEM_ALLOCATION_TYPE_DEFAULT;
+        prop.location.type = CN_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device;
+        prop.requestedHandleTypes = CN_MEM_HANDLE_TYPE_NONE;
+        return prop;
+    }
+    [[maybe_unused]] static size_t cu_mem_get_allocation_size(size_t raw_size, CUdevice device) {
+        auto prop = cu_mem_get_allocation_prop(device);
+        size_t granularity = 0;
+        CURESULT_CHECK(cnMemGetAllocationGranularity(&granularity, &prop, CN_MEM_ALLOC_GRANULARITY_MINIMUM));
+        SIMPLE_CHECK(granularity > 0, "zero MLU VMM granularity");
+        SIMPLE_CHECK(raw_size <= std::numeric_limits<size_t>::max() - (granularity - 1), "MLU allocation size overflow");
+        return ((raw_size + granularity - 1) / granularity) * granularity;
+    }
+    [[maybe_unused]] static size_t cu_mem_get_reserve_size(size_t allocation_size, CUdevice /*device*/) {
+        return allocation_size;
+    }
+
+    [[maybe_unused]] static cudaError_t cu_mem_create(CUmemGenericAllocationHandle *handle, size_t size, CUdevice device) {
+        auto prop = cu_mem_get_allocation_prop(device);
+        CNresult result = cnMemCreate(handle, size, &prop, 0);
+        if (result == CN_MEMORY_ERROR_OUT_OF_MEMORY) return cudaErrorMemoryAllocation;
+        CURESULT_CHECK(result);
+        return cudaSuccess;
+    }
+    [[maybe_unused]] static void cu_mem_set_access(void *ptr, size_t size, CUdevice device) {
+        CNmemAccessDesc access = {};
+        access.location.type = CN_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = device;
+        access.accessFlags = CN_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CURESULT_CHECK(cnMemSetAccess((CNaddr)ptr, size, &access, 1));
+    }
+    [[maybe_unused]] static CUdevice cu_ctx_get_device() {
+        CNdev device;
+        CURESULT_CHECK(cnCtxGetDevice(&device));
+        return device;
+    }
+    [[maybe_unused]] static CUdevice cu_device_get(int ordinal) {
+        CNdev device;
+        CURESULT_CHECK(cnDeviceGet(&device, ordinal));
+        return device;
+    }
 #elif defined(USE_CUDA)
-    static cudaError_t cu_mem_create(CUmemGenericAllocationHandle *alloc_handle, size_t size, CUdevice device) {
+    static CUmemAllocationProp cu_mem_get_allocation_prop(CUdevice device) {
         CUmemAllocationProp prop = {};
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -161,7 +199,29 @@ namespace CUDAUtils {
             prop.allocFlags.gpuDirectRDMACapable = 1;
         }
 
-        CUresult ret = cuMemCreate(alloc_handle, size, &prop, 0);
+        return prop;
+    }
+
+    static size_t cu_mem_get_allocation_size(size_t raw_size, CUdevice device) {
+        const CUmemAllocationProp prop = cu_mem_get_allocation_prop(device);
+        size_t granularity = 0;
+        CURESULT_CHECK(cuMemGetAllocationGranularity(
+            &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        SIMPLE_CHECK(granularity > 0, "cuMemGetAllocationGranularity returned zero");
+        SIMPLE_CHECK(
+            raw_size <= std::numeric_limits<size_t>::max() - (granularity - 1),
+            "allocation size overflow while applying CUDA VMM granularity");
+        return ((raw_size + granularity - 1) / granularity) * granularity;
+    }
+
+    static size_t cu_mem_get_reserve_size(size_t allocation_size, CUdevice /*device*/) {
+        return allocation_size;
+    }
+
+    static cudaError_t cu_mem_create(CUmemGenericAllocationHandle *alloc_handle, size_t allocation_size, CUdevice device) {
+        const CUmemAllocationProp prop = cu_mem_get_allocation_prop(device);
+
+        CUresult ret = cuMemCreate(alloc_handle, allocation_size, &prop, 0);
         if (ret == CUDA_ERROR_OUT_OF_MEMORY) {
             std::cerr << "[torch_memory_saver.cpp] cuMemCreate CUDA_ERROR_OUT_OF_MEMORY (may not be an issue e.g. torch allocator will free cache and retry)" << std::endl;
             return cudaErrorMemoryAllocation;
@@ -171,12 +231,12 @@ namespace CUDAUtils {
         return cudaSuccess;
     }
 
-    static void cu_mem_set_access(void *ptr, size_t size, CUdevice device) {
+    static void cu_mem_set_access(void *ptr, size_t allocation_size, CUdevice device) {
         CUmemAccessDesc access_desc = {};
         access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         access_desc.location.id = device;
         access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        CURESULT_CHECK(cuMemSetAccess((CUdeviceptr) ptr, size, &access_desc, 1));
+        CURESULT_CHECK(cuMemSetAccess((CUdeviceptr) ptr, allocation_size, &access_desc, 1));
     }
 
     static CUdevice cu_ctx_get_device() {
@@ -188,6 +248,81 @@ namespace CUDAUtils {
     static CUdevice cu_device_get(int device_ordinal) {
         CUdevice ans;
         CURESULT_CHECK(cuDeviceGet(&ans, device_ordinal));
+        return ans;
+    }
+
+#elif defined(USE_XPU)
+    [[maybe_unused]] static CUdevice cu_device_get(int device_ordinal) {
+        return static_cast<CUdevice>(device_ordinal);
+    }
+
+    [[maybe_unused]] static CUdevice cu_ctx_get_device() {
+        return 0;
+    }
+
+#elif defined(USE_MUSA)
+    [[maybe_unused]] static MUmemAllocationProp cu_mem_get_allocation_prop(MUdevice device) {
+        MUmemAllocationProp prop = {};
+        prop.type = MU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = MU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device;
+
+        int flag = 0;
+        CURESULT_CHECK(muDeviceGetAttribute(
+            &flag, MU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_MUSA_VMM_SUPPORTED, device));
+        if (flag) {  // support GPUDirect RDMA if possible
+            prop.allocFlags.gpuDirectRDMACapable = 1;
+        }
+
+        return prop;
+    }
+
+    [[maybe_unused]] static size_t cu_mem_get_allocation_size(size_t raw_size, MUdevice device) {
+        const MUmemAllocationProp prop = cu_mem_get_allocation_prop(device);
+        size_t granularity = 0;
+        CURESULT_CHECK(muMemGetAllocationGranularity(
+            &granularity, &prop, MU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        SIMPLE_CHECK(granularity > 0, "muMemGetAllocationGranularity returned zero");
+        SIMPLE_CHECK(
+            raw_size <= std::numeric_limits<size_t>::max() - (granularity - 1),
+            "allocation size overflow while applying MUSA VMM granularity");
+        return ((raw_size + granularity - 1) / granularity) * granularity;
+    }
+
+    [[maybe_unused]] static size_t cu_mem_get_reserve_size(size_t allocation_size, MUdevice /*device*/) {
+        return allocation_size;
+    }
+
+    [[maybe_unused]] static musaError_t cu_mem_create(MUmemGenericAllocationHandle *alloc_handle, size_t allocation_size, MUdevice device) {
+        const MUmemAllocationProp prop = cu_mem_get_allocation_prop(device);
+
+        MUresult ret = muMemCreate(alloc_handle, allocation_size, &prop, 0);
+        if (ret == MUSA_ERROR_OUT_OF_MEMORY) {
+            std::cerr << "[torch_memory_saver.cpp] muMemCreate MUSA_ERROR_OUT_OF_MEMORY (may not be an issue e.g. torch allocator will free cache and retry)" << std::endl;
+            return musaErrorMemoryAllocation;
+        }
+        CURESULT_CHECK(ret);
+
+        return musaSuccess;
+    }
+
+    [[maybe_unused]] static void cu_mem_set_access(void *ptr, size_t allocation_size, MUdevice device) {
+        MUmemAccessDesc access_desc = {};
+        access_desc.location.type = MU_MEM_LOCATION_TYPE_DEVICE;
+        access_desc.location.id = device;
+        access_desc.flags = MU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CURESULT_CHECK(muMemSetAccess((MUdeviceptr) ptr, allocation_size, &access_desc, 1));
+    }
+
+    [[maybe_unused]] static MUdevice cu_ctx_get_device() {
+        MUdevice ans;
+        CURESULT_CHECK(muCtxGetDevice(&ans));
+        return ans;
+    }
+
+    [[maybe_unused]] static MUdevice cu_device_get(int device_ordinal) {
+        MUdevice ans;
+        CURESULT_CHECK(muDeviceGet(&ans, device_ordinal));
         return ans;
     }
 

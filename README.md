@@ -52,6 +52,20 @@ Not only does torch_memory_saver make tensors compatible with CUDA graph, but we
 
 API: Change `torch.cuda.graph(...)` to `torch_memory_saver.cuda_graph(...)`
 
+If a retained CUDA graph contains NCCL operations on TMS-managed buffers, NCCL
+graph registrations can become stale when TMS replaces the buffers' physical
+backing during `pause()` / `resume()`, and graph replay may hang
+([#88](https://github.com/fzyzcjy/torch_memory_saver/issues/88)). Either keep
+buffers passed to NCCL operations outside TMS-managed regions, or disable NCCL
+graph user-buffer registration before starting the workload:
+
+```bash
+export NCCL_GRAPH_REGISTER=0
+```
+
+This leaves NCCL and CUDA graphs enabled, but may give up the associated
+zero-copy optimization from NCCL CUDA-graph user-buffer registration.
+
 ### CPU Backup
 
 By default, in order to save time, the content is thrown away. This is useful for, for example, KV cache that are to be staled, or model weights that are to be updated.
@@ -67,6 +81,34 @@ torch_memory_saver.resume()
 
 assert tensor1[0] == 42, "content is kept unchanged"
 ```
+
+The default host shadow is pinned (`cpu_backup_backend="pinned"`). If process RSS remains resident after a non-retaining resume with the pinned backend, CUDA/MUSA users can select `cpu_backup_backend="mmap"` (or `TMS_INIT_CPU_BACKUP_BACKEND=mmap`) so releasing the host shadow uses `munmap` instead of `cudaFreeHost`. Both backends release the host shadow on resume unless retention is enabled.
+
+```python
+with torch_memory_saver.region(enable_cpu_backup=True, cpu_backup_backend="mmap"):
+    ...
+```
+
+ROCm stays pinned (`hipHostMalloc`); `cpu_backup_backend="mmap"` is rejected. On the legacy ROCm path, host shadows are retained across resume. XPU host shadows are pageable `malloc`/`free`; `cpu_backup_backend` is not supported there.
+
+`TMS_INIT_CPU_BACKUP_BACKEND=mmap|pinned` sets the process default for preload / env-driven integrations; an explicit `cpu_backup_backend=` argument overrides it.
+
+Pinned or mmap CPU backups on CUDA, MUSA and MLU, and pinned backups on ROCm 7+, can be retained
+across resume cycles to avoid reallocating them before every pause:
+
+```python
+torch_memory_saver.retain_cpu_backup = True
+```
+
+Set `TMS_RETAIN_CPU_BACKUP=1` before process startup to enable the same policy,
+including for preload mode. Retention needs CUDA, MUSA, MLU or ROCm 7+ and can consume host RAM
+equal to the backed-up allocations. While enabled, `get_cpu_backup` continues
+to expose the retained backup after resume. Without retention on CUDA, MUSA, MLU or ROCm 7+,
+`get_cpu_backup` is only valid while allocations are paused.
+
+The retention policy is consulted on resume. Setting it to `False` does not eagerly free
+backups for active allocations; they are released by a later non-retaining
+resume, when the allocation is freed, or when the process exits.
 
 ### Hook Modes
 
@@ -84,6 +126,118 @@ torch_memory_saver.hook_mode = "torch"
 ### Example of RL with CUDA Graph
 
 Please refer to `rl_example.py` for details.
+
+## Platform Support
+
+| Platform | Backend | Hook modes | Install |
+|----------|---------|------------|---------|
+| NVIDIA (CUDA) | CUDA VMM (`cuMemMap`/`cuMemCreate`) | preload, torch | `pip install torch_memory_saver` (prebuilt wheel) |
+| AMD (ROCm) | HIP VMM (`hipMemMap`/`hipMemCreate`) | preload, torch | `pip install torch_memory_saver` (prebuilt wheel) |
+| Intel (XPU) | Level Zero VMM (`zeVirtualMemMap`/`zePhysicalMemCreate`) | torch only | `pip install` from source (builds against local oneAPI) |
+| Moore Threads (MUSA) | MUSA VMM (`muMemMap`/`muMemCreate`) | preload, torch | `pip install` from source (builds against local MUSA toolkit) |
+| Cambricon (MLU) | CNDriver VMM (`cnMemMap`/`cnMemCreate`) | preload, torch | `pip install` from source (builds against local Neuware) |
+
+### Intel XPU
+
+Same pause/resume behavior on Intel GPUs via Level Zero VMM, wired into PyTorch
+through `XPUPluggableAllocator` + `torch.xpu.MemPool`. Only `hook_mode="torch"`
+is supported (preload is not available on XPU); pauseable CUDA-graph capture is not.
+
+Install from source (no prebuilt wheel). `TMS_PLATFORM=xpu` forces the backend;
+`--no-build-isolation` lets the build see `torch+xpu` and ABI-match `libsycl` to
+it (otherwise a mismatched oneAPI silently produces a broken `.so`):
+
+```bash
+# Prerequisites: torch+xpu, Intel oneAPI (icpx) + Level Zero headers.
+source /opt/intel/oneapi/setvars.sh          # put icpx on PATH (or set ICPX=...)
+TMS_PLATFORM=xpu pip install --no-build-isolation .   # or `make build-xpu`
+```
+
+If the sourced oneAPI's `libsycl` major differs from your torch runtime's, pin a
+matching compiler with `ICPX=/opt/intel/oneapi/compiler/<ver>/bin/icpx`. Then use
+`region`/`pause`/`resume` as on CUDA with `hook_mode="torch"`, `device="xpu"`.
+
+Note: `torch.xpu.memory_allocated()` / `mem_get_info()` do not reflect pages
+released by `zeVirtualMemUnmap`; use sysman (`ZES_ENABLE_SYSMAN=1`) to verify.
+
+### Moore Threads (MUSA)
+
+Same pause/resume behavior on MUSA GPUs via MUSA VMM, through
+`torch.musa.memory.MUSAPluggableAllocator` + `torch.musa.MemPool` in torch mode
+and the `musaMalloc`/`musaFree` preload hook. Install from source against the
+local MUSA toolkit (`MUSA_HOME` or `MUSA_PATH`, or `mcc` on `PATH`):
+
+```bash
+TMS_PLATFORM=musa pip install --no-build-isolation .   # or `make build-musa`
+```
+
+The MUSA build uses the same plain host C++ compilation as the other
+source-installed backends; `mcc` is only used to locate the toolkit, and
+`pytorch_musa` is needed at runtime rather than at build time.
+
+MUSA differs from CUDA in two observable ways: `resume()` zeroes a region
+without CPU backup instead of leaving it undefined, and `empty_cache()` is a
+no-op inside `disable()` because `torch_musa` aborts while a pool is active.
+`disable()` must be called outside a `region()`; nested and overlapping scopes
+are rejected, matching CUDA (which aborts in `~MemPool` there).
+
+torch_musa before 2.9.1.post2-rc2 has no `MemPool` destructor, so `disable()`
+releases its pool through `torch_memory_saver/musa_pool.py`; the wrapper can be
+removed once the minimum supported torch_musa version reaches that release.
+Allocations made by MCCL and muDNN themselves bypass the preload hook, since
+those libraries cannot operate on VMM-backed buffers.
+
+TMS does not alias `torch.cuda.*` to MUSA. Call `torch.musa.empty_cache()` on
+MUSA; the native `torch.cuda.empty_cache()` entry point does not release MUSA
+blocks.
+
+### Cambricon MLU
+
+Build with the Neuware headers and libraries available locally. Install a
+compatible `torch_mlu` first and expose Neuware's runtime libraries to the loader:
+
+```bash
+export NEUWARE_HOME=${NEUWARE_HOME:-/usr/local/neuware}
+export LD_LIBRARY_PATH="$NEUWARE_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+pip install --no-build-isolation .
+```
+
+The build detects MLU from the Neuware headers and libraries after checking for
+HIP, CUDA, MUSA, and XPU. Use `make build-mlu` or set `TMS_PLATFORM=mlu` to
+force MLU on a host with multiple toolchains.
+
+With a compatible installation, importing `torch` automatically registers MLU.
+If `TORCH_DEVICE_BACKEND_AUTOLOAD=0`, import `torch_mlu` before first using
+TorchMemorySaver. Backend detection does not load `torch_mlu` itself.
+
+Torch mode uses `MLUPluggableAllocator` and `torch.mlu.MemPool`. Preload mode
+intercepts `cnrtMalloc`/`cnrtFree`; start the child under `configure_subprocess()`
+so the hook is loaded before the runtime. Pause releases physical memory while
+preserving virtual addresses. CPU backups support pinned and mmap storage,
+including retained backups. Without a backup, rewrite contents after resume.
+
+MLU regions and `disable()` use the current device. Select the device before
+entering each region; a tensor's `device=` argument alone is insufficient:
+
+```python
+with torch.mlu.device(1), torch_memory_saver.region("weights", enable_cpu_backup=True):
+    weights = torch.ones(1024, device="mlu:1")
+```
+
+Use a separate device scope and region for each device. Pool routing is
+device-wide: avoid concurrent allocations from other threads on the same
+device while a region or `disable()` scope is active.
+
+Pauseable `torch.mlu.MLUGraph` capture requires preload mode. Torch mode does
+not support graph memory release. Do not change a shared saver's hook mode
+from preload to torch when graph memory release is needed. Expandable segments
+(`PYTORCH_MLU_ALLOC_CONF=expandable_segments:True`) are unsupported.
+
+Run the common regression suite and MLU lifecycle checks on idle devices:
+
+```bash
+CN_VISIBLE_DEVICES=0,1 python -m pytest test -v -ra --tb=short
+```
 
 ## Development
 
