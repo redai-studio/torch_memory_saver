@@ -1,15 +1,31 @@
 import logging
 
+import torch
+
 from torch_memory_saver.hooks.base import HookUtilBase
-from torch_memory_saver.utils import get_binary_path_from_package
-from torch.cuda.memory import CUDAPluggableAllocator
+from torch_memory_saver.utils import is_mlu, is_xpu, get_binary_path_from_package
 
 logger = logging.getLogger(__name__)
 
 
 class HookUtilModeTorch(HookUtilBase):
     def __init__(self):
-        self.allocator = CUDAPluggableAllocator(self.get_path_binary(), "tms_torch_malloc", "tms_torch_free")
+        if is_mlu():
+            PluggableAllocator = torch.mlu.memory.MLUPluggableAllocator
+        elif is_xpu():
+            from torch.xpu.memory import XPUPluggableAllocator
+
+            PluggableAllocator = XPUPluggableAllocator
+        elif hasattr(torch, "musa"):
+            # MUSA torch builds keep the pluggable allocator under torch.musa.
+            PluggableAllocator = torch.musa.memory.MUSAPluggableAllocator
+        else:
+            from torch.cuda.memory import CUDAPluggableAllocator
+
+            PluggableAllocator = CUDAPluggableAllocator
+        self.allocator = PluggableAllocator(
+            self.get_path_binary(), "tms_torch_malloc", "tms_torch_free"
+        )
         logger.debug(f"HookUtilModeTorch {self.allocator=} {self.get_path_binary()=}")
 
     def get_path_binary(self):
